@@ -195,6 +195,7 @@
 
 -type req_opts() :: #{
 	flow => pos_integer(),
+	normalize_headers => boolean(),
 	reply_to => pid(),
 	tunnel => stream_ref()
 }.
@@ -267,6 +268,7 @@
 	compress => boolean(),
 	flow => pos_integer(),
 	keepalive => timeout(),
+	normalize_headers => boolean(),
 	protocols => [{binary(), module()}],
 	reply_to => pid(),
 	silence_pings => boolean(),
@@ -621,8 +623,9 @@ headers(ServerPid, Method, Path, Headers0, ReqOpts) ->
 	StreamRef = make_stream_ref(Tunnel),
 	InitialFlow = maps:get(flow, ReqOpts, infinity),
 	ReplyTo = maps:get(reply_to, ReqOpts, self()),
+	NormalizeHeaders = maps:get(normalize_headers, ReqOpts, true),
 	gen_statem:cast(ServerPid, {headers, ReplyTo, StreamRef,
-		Method, Path, normalize_headers(Headers0), InitialFlow}),
+		Method, Path, normalize_headers(Headers0, NormalizeHeaders), InitialFlow}),
 	StreamRef.
 
 -spec request(pid(), iodata(), iodata(), req_headers(), iodata()) -> stream_ref().
@@ -635,8 +638,9 @@ request(ServerPid, Method, Path, Headers, Body, ReqOpts) ->
 	StreamRef = make_stream_ref(Tunnel),
 	InitialFlow = maps:get(flow, ReqOpts, infinity),
 	ReplyTo = maps:get(reply_to, ReqOpts, self()),
+	NormalizeHeaders = maps:get(normalize_headers, ReqOpts, true),
 	gen_statem:cast(ServerPid, {request, ReplyTo, StreamRef,
-		Method, Path, normalize_headers(Headers), Body, InitialFlow}),
+		Method, Path, normalize_headers(Headers, NormalizeHeaders), Body, InitialFlow}),
 	StreamRef.
 
 get_tunnel(#{tunnel := Tunnel}) when is_reference(Tunnel) ->
@@ -648,6 +652,11 @@ get_tunnel(_) ->
 
 make_stream_ref(undefined) -> make_ref();
 make_stream_ref(Tunnel) -> Tunnel ++ [make_ref()].
+
+normalize_headers(Headers, false) ->
+    Headers;
+normalize_headers(Headers, _) ->
+    normalize_headers(Headers).
 
 normalize_headers([]) ->
 	[];
@@ -930,7 +939,8 @@ ws_upgrade(ServerPid, Path, Headers, Opts0) ->
 	ok = gun_ws:check_options(Opts),
 	StreamRef = make_stream_ref(Tunnel),
 	ReplyTo = maps:get(reply_to, Opts, self()),
-	gen_statem:cast(ServerPid, {ws_upgrade, ReplyTo, StreamRef, Path, normalize_headers(Headers), Opts}),
+	NormalizeHeaders = maps:get(normalize_headers, Opts, true),
+	gen_statem:cast(ServerPid, {ws_upgrade, ReplyTo, StreamRef, Path, normalize_headers(Headers, NormalizeHeaders), Opts}),
 	StreamRef.
 
 -spec ws_send(pid(), stream_ref(), ws_frame() | [ws_frame()]) -> ok.
