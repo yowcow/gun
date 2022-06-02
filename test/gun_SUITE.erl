@@ -107,6 +107,21 @@ ignore_empty_data_http(_) ->
 	1 = length(Zero),
 	gun:close(Pid).
 
+ignore_empty_data_fin_http(_) ->
+	doc("When gun:data/4 is called with fin and empty data, it must send a final empty chunk."),
+	{ok, OriginPid, OriginPort} = init_origin(tcp, http),
+	{ok, Pid} = gun:open("localhost", OriginPort),
+	{ok, http} = gun:await_up(Pid),
+	handshake_completed = receive_from(OriginPid),
+	Ref = gun:post(Pid, "/", []),
+	gun:data(Pid, Ref, nofin, "hello"),
+	gun:data(Pid, Ref, fin, ["", <<>>]),
+	Data = receive_all_from(OriginPid, 500),
+	Lines = binary:split(Data, <<"\r\n">>, [global]),
+	Zero = [Z || <<"0">> = Z <- Lines],
+	1 = length(Zero),
+	gun:close(Pid).
+
 ignore_empty_data_http2(_) ->
 	doc("When gun:data/4 is called with nofin and empty data, it must be ignored."),
 	{ok, OriginPid, OriginPort} = init_origin(tcp, http2),
@@ -125,6 +140,29 @@ ignore_empty_data_http2(_) ->
 		6:24, 0, _:7, 0:1, _:32, "hello ",
 		%% Second and final DATA frame.
 		6:24, 0, _:7, 1:1, _:32, "world!"
+	>> = Data,
+	gun:close(Pid).
+
+ignore_empty_data_fin_http2(_) ->
+	doc("When gun:data/4 is called with fin and empty data, it must send a final empty DATA frame."),
+	{ok, OriginPid, OriginPort} = init_origin(tcp, http2),
+	{ok, Pid} = gun:open("localhost", OriginPort, #{protocols => [http2]}),
+	{ok, http2} = gun:await_up(Pid),
+	handshake_completed = receive_from(OriginPid),
+	Ref = gun:put(Pid, "/", []),
+	gun:data(Pid, Ref, nofin, "hello "),
+	gun:data(Pid, Ref, nofin, "world!"),
+	gun:data(Pid, Ref, fin, ["", <<>>]),
+	Data = receive_all_from(OriginPid, 500),
+	<<
+		%% HEADERS frame.
+		Len1:24, 1, _:40, _:Len1/unit:8,
+		%% First DATA frame.
+		6:24, 0, _:7, 0:1, _:32, "hello ",
+		%% Second DATA frame.
+		6:24, 0, _:7, 0:1, _:32, "world!",
+		%% Final empty DATA frame.
+		0:24, 0, _:7, 1:1, _:32
 	>> = Data,
 	gun:close(Pid).
 
@@ -418,6 +456,34 @@ retry_timeout(_) ->
 	{_, connect_end, #{error := _}} = receive_event(ConnPid),
 	{_, terminate, _} = receive_event(ConnPid),
 	ok.
+
+server_name_indication_custom(_) ->
+	doc("Ensure a custom server_name_indication is accepted."),
+	do_server_name_indication("localhost", net_adm:localhost(), #{
+		tls_opts => [{server_name_indication, net_adm:localhost()}]
+	}).
+
+server_name_indication_default(_) ->
+	doc("Ensure a default server_name_indication is accepted."),
+	do_server_name_indication(net_adm:localhost(), net_adm:localhost(), #{}).
+
+do_server_name_indication(Host, Expected, GunOpts) ->
+	Self = self(),
+	{ok, OriginPid, OriginPort} = init_origin(tls, http,
+		fun(_, ClientSocket, _) ->
+			{ok, Info} = ssl:connection_information(ClientSocket),
+			Msg = {sni_hostname, _} = lists:keyfind(sni_hostname, 1, Info),
+			Self ! Msg
+		end),
+	{ok, ConnPid} = gun:open(Host, OriginPort, GunOpts#{
+		transport => tls,
+		retry => 0
+	}),
+	handshake_completed = receive_from(OriginPid),
+	%% The connection will succeed, look up the SNI hostname
+	%% and send it to us as a message, where we can check it.
+	{sni_hostname, Expected} = receive Msg = {sni_hostname, _} -> Msg end,
+	gun:close(ConnPid).
 
 set_owner(_) ->
 	doc("The owner of the connection can be changed."),
