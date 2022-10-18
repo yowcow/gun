@@ -113,7 +113,8 @@ init(ReplyTo, OriginSocket, OriginTransport, Opts=#{stream_ref := StreamRef, tun
 		%% Initialize the protocol.
 		#{new_protocol := NewProtocol} ->
 			{Proto, ProtoOpts} = gun_protocols:handler_and_opts(NewProtocol, Opts),
-			{_, ProtoState} = Proto:init(ReplyTo, OriginSocket, OriginTransport,
+			%% @todo Handle error result from Proto:init/4
+			{ok, _, ProtoState} = Proto:init(ReplyTo, OriginSocket, OriginTransport,
 				ProtoOpts#{stream_ref => StreamRef, tunnel_transport => tcp}),
 			EvHandlerState = EvHandler:protocol_changed(#{
 				stream_ref => StreamRef,
@@ -151,13 +152,13 @@ init(ReplyTo, OriginSocket, OriginTransport, Opts=#{stream_ref := StreamRef, tun
 
 %% When we receive data we pass it forward directly for TCP;
 %% or we decrypt it and pass it via handle_continue for TLS.
-handle(Data, State0=#tunnel_state{transport=gun_tcp_proxy,
+handle(Data, State=#tunnel_state{transport=gun_tcp_proxy,
 		protocol=Proto, protocol_state=ProtoState0},
 		CookieStore0, EvHandler, EvHandlerState0) ->
 	{Commands, CookieStore, EvHandlerState1} = Proto:handle(
 		Data, ProtoState0, CookieStore0, EvHandler, EvHandlerState0),
-	{State, EvHandlerState} = commands(Commands, State0, EvHandler, EvHandlerState1),
-	{{state, State}, CookieStore, EvHandlerState};
+	{ResCommands, EvHandlerState} = commands(Commands, State, EvHandler, EvHandlerState1),
+	{ResCommands, CookieStore, EvHandlerState};
 handle(Data, State=#tunnel_state{transport=gun_tls_proxy,
 		socket=ProxyPid, tls_origin_socket=OriginSocket},
 		CookieStore, _EvHandler, EvHandlerState) ->
@@ -195,7 +196,8 @@ handle_continue(ContinueStreamRef, {gun_tls_proxy, ProxyPid, {ok, Negotiated},
 		reply_to => ReplyTo,
 		stream_ref => StreamRef
 	},
-	{_, ProtoState} = Proto:init(ReplyTo, OriginSocket, gun_tcp_proxy,
+	%% @todo Handle error result from Proto:init/4
+	{ok, _, ProtoState} = Proto:init(ReplyTo, OriginSocket, gun_tcp_proxy,
 		ProtoOpts#{stream_ref => StreamRef, tunnel_transport => tls}),
 	ReplyTo ! {gun_tunnel_up, self(), StreamRef, Proto:name()},
 	{{state, State#tunnel_state{protocol=Proto, protocol_state=ProtoState}},
@@ -224,13 +226,13 @@ handle_continue(ContinueStreamRef, {data, _ReplyTo, _StreamRef, IsFin, Data},
 		when is_reference(ContinueStreamRef) ->
 	{{send, IsFin, Data}, CookieStore, EvHandlerState};
 handle_continue(ContinueStreamRef, {tls_proxy, ProxyPid, Data},
-		State0=#tunnel_state{socket=ProxyPid, protocol=Proto, protocol_state=ProtoState},
+		State=#tunnel_state{socket=ProxyPid, protocol=Proto, protocol_state=ProtoState},
 		CookieStore0, EvHandler, EvHandlerState0)
 		when is_reference(ContinueStreamRef) ->
 	{Commands, CookieStore, EvHandlerState1} = Proto:handle(
 		Data, ProtoState, CookieStore0, EvHandler, EvHandlerState0),
-	{State, EvHandlerState} = commands(Commands, State0, EvHandler, EvHandlerState1),
-	{{state, State}, CookieStore, EvHandlerState};
+	{ResCommands, EvHandlerState} = commands(Commands, State, EvHandler, EvHandlerState1),
+	{ResCommands, CookieStore, EvHandlerState};
 handle_continue(ContinueStreamRef, {tls_proxy_closed, ProxyPid},
 		#tunnel_state{socket=ProxyPid}, CookieStore, _EvHandler, EvHandlerState0)
 		when is_reference(ContinueStreamRef) ->
@@ -246,7 +248,7 @@ handle_continue(ContinueStreamRef, {tls_proxy_error, ProxyPid, Reason},
 %%
 %% @todo Assert StreamRef to be our reference().
 handle_continue([_StreamRef|ContinueStreamRef0], Msg,
-		State0=#tunnel_state{protocol=Proto, protocol_state=ProtoState},
+		State=#tunnel_state{protocol=Proto, protocol_state=ProtoState},
 		CookieStore0, EvHandler, EvHandlerState0) ->
 	ContinueStreamRef = case ContinueStreamRef0 of
 		[CSR] -> CSR;
@@ -254,16 +256,16 @@ handle_continue([_StreamRef|ContinueStreamRef0], Msg,
 	end,
 	{Commands, CookieStore, EvHandlerState1} = Proto:handle_continue(
 		ContinueStreamRef, Msg, ProtoState, CookieStore0, EvHandler, EvHandlerState0),
-	{State, EvHandlerState} = commands(Commands, State0, EvHandler, EvHandlerState1),
-	{{state, State}, CookieStore, EvHandlerState}.
+	{ResCommands, EvHandlerState} = commands(Commands, State, EvHandler, EvHandlerState1),
+	{ResCommands, CookieStore, EvHandlerState}.
 
 %% @todo This function will need EvHandler/EvHandlerState?
-update_flow(State0=#tunnel_state{protocol=Proto, protocol_state=ProtoState},
+update_flow(State=#tunnel_state{protocol=Proto, protocol_state=ProtoState},
 		ReplyTo, StreamRef0, Inc) ->
-	StreamRef = maybe_dereference(State0, StreamRef0),
+	StreamRef = maybe_dereference(State, StreamRef0),
 	Commands = Proto:update_flow(ProtoState, ReplyTo, StreamRef, Inc),
-	{State, undefined} = commands(Commands, State0, undefined, undefined),
-	{state, State}.
+	{ResCommands, undefined} = commands(Commands, State, undefined, undefined),
+	ResCommands.
 
 closing(_Reason, _State, _EvHandler, EvHandlerState) ->
 	%% @todo Graceful shutdown must be propagated to tunnels.
@@ -278,27 +280,27 @@ keepalive(_State, _EvHandler, EvHandlerState) ->
 	{[], EvHandlerState}.
 
 %% We pass the headers forward and optionally dereference StreamRef.
-headers(State0=#tunnel_state{protocol=Proto, protocol_state=ProtoState0},
+headers(State=#tunnel_state{protocol=Proto, protocol_state=ProtoState0},
 		StreamRef0, ReplyTo, Method, Host, Port, Path, Headers,
 		InitialFlow, CookieStore0, EvHandler, EvHandlerState0) ->
-	StreamRef = maybe_dereference(State0, StreamRef0),
+	StreamRef = maybe_dereference(State, StreamRef0),
 	{Commands, CookieStore, EvHandlerState1} = Proto:headers(ProtoState0, StreamRef,
 		ReplyTo, Method, Host, Port, Path, Headers,
 		InitialFlow, CookieStore0, EvHandler, EvHandlerState0),
-	{State, EvHandlerState} = commands(Commands, State0, EvHandler, EvHandlerState1),
-	{{state, State}, CookieStore, EvHandlerState}.
+	{ResCommands, EvHandlerState} = commands(Commands, State, EvHandler, EvHandlerState1),
+	{ResCommands, CookieStore, EvHandlerState}.
 
 %% We pass the request forward and optionally dereference StreamRef.
-request(State0=#tunnel_state{protocol=Proto, protocol_state=ProtoState0,
+request(State=#tunnel_state{protocol=Proto, protocol_state=ProtoState0,
 		info=#{origin_host := OriginHost, origin_port := OriginPort}},
 		StreamRef0, ReplyTo, Method, _Host, _Port, Path, Headers, Body,
 		InitialFlow, CookieStore0, EvHandler, EvHandlerState0) ->
-	StreamRef = maybe_dereference(State0, StreamRef0),
+	StreamRef = maybe_dereference(State, StreamRef0),
 	{Commands, CookieStore, EvHandlerState1} = Proto:request(ProtoState0, StreamRef,
 		ReplyTo, Method, OriginHost, OriginPort, Path, Headers, Body,
 		InitialFlow, CookieStore0, EvHandler, EvHandlerState0),
-	{State, EvHandlerState} = commands(Commands, State0, EvHandler, EvHandlerState1),
-	{{state, State}, CookieStore, EvHandlerState}.
+	{ResCommands, EvHandlerState} = commands(Commands, State, EvHandler, EvHandlerState1),
+	{ResCommands, CookieStore, EvHandlerState}.
 
 %% When the next tunnel is SOCKS we pass the data forward directly.
 %% This is needed because SOCKS has no StreamRef and the data cannot
@@ -308,8 +310,8 @@ data(State=#tunnel_state{protocol=Proto, protocol_state=ProtoState0,
 		StreamRef, ReplyTo, IsFin, Data, EvHandler, EvHandlerState0) ->
 	{Commands, EvHandlerState1} = Proto:data(ProtoState0, StreamRef,
 		ReplyTo, IsFin, Data, EvHandler, EvHandlerState0),
-	{State1, EvHandlerState} = commands(Commands, State, EvHandler, EvHandlerState1),
-	{{state, State1}, EvHandlerState};
+	{ResCommands, EvHandlerState} = commands(Commands, State, EvHandler, EvHandlerState1),
+	{ResCommands, EvHandlerState};
 %% CONNECT tunnels pass the data forward and dereference StreamRef
 %% unless they are the recipient of the callback, in which case the
 %% data is sent to the socket.
@@ -325,9 +327,9 @@ data(State=#tunnel_state{socket=Socket, transport=Transport,
 			StreamRef = maybe_dereference(State, StreamRef0),
 			{Commands, EvHandlerState1} = Proto:data(ProtoState0, StreamRef,
 				ReplyTo, IsFin, Data, EvHandler, EvHandlerState0),
-			{State1, EvHandlerState} = commands(Commands, State,
+			{ResCommands, EvHandlerState} = commands(Commands, State,
 				EvHandler, EvHandlerState1),
-			{{state, State1}, EvHandlerState}
+			{ResCommands, EvHandlerState}
 	end.
 
 %% We pass the CONNECT request forward and optionally dereference StreamRef.
@@ -339,16 +341,16 @@ connect(State=#tunnel_state{info=#{origin_host := Host, origin_port := Port},
 	{Commands, EvHandlerState1} = Proto:connect(ProtoState0, StreamRef,
 		ReplyTo, Destination, #{host => Host, port => Port}, Headers, InitialFlow,
 		EvHandler, EvHandlerState0),
-	{State1, EvHandlerState} = commands(Commands, State, EvHandler, EvHandlerState1),
-	{{state, State1}, EvHandlerState}.
+	{ResCommands, EvHandlerState} = commands(Commands, State, EvHandler, EvHandlerState1),
+	{ResCommands, EvHandlerState}.
 
 cancel(State=#tunnel_state{protocol=Proto, protocol_state=ProtoState0},
 		StreamRef0, ReplyTo, EvHandler, EvHandlerState0) ->
 	StreamRef = maybe_dereference(State, StreamRef0),
 	{Commands, EvHandlerState1} = Proto:cancel(ProtoState0, StreamRef,
 		ReplyTo, EvHandler, EvHandlerState0),
-	{State1, EvHandlerState} = commands(Commands, State, EvHandler, EvHandlerState1),
-	{{state, State1}, EvHandlerState}.
+	{ResCommands, EvHandlerState} = commands(Commands, State, EvHandler, EvHandlerState1),
+	{ResCommands, EvHandlerState}.
 
 timeout(State=#tunnel_state{protocol=Proto, protocol_state=ProtoState0}, Msg, TRef) ->
 	case Proto:timeout(ProtoState0, Msg, TRef) of
@@ -434,23 +436,32 @@ ws_upgrade(State=#tunnel_state{info=TunnelInfo, protocol=Proto, protocol_state=P
 	{Commands, CookieStore, EvHandlerState1} = Proto:ws_upgrade(ProtoState0, StreamRef, ReplyTo,
 		Host, Port, Path, Headers, WsOpts,
 		CookieStore0, EvHandler, EvHandlerState0),
-	{State1, EvHandlerState} = commands(Commands, State, EvHandler, EvHandlerState1),
-	{{state, State1}, CookieStore, EvHandlerState}.
+	{ResCommands, EvHandlerState} = commands(Commands, State, EvHandler, EvHandlerState1),
+	{ResCommands, CookieStore, EvHandlerState}.
 
-ws_send(Frames, State0=#tunnel_state{protocol=Proto, protocol_state=ProtoState},
+ws_send(Frames, State=#tunnel_state{protocol=Proto, protocol_state=ProtoState},
 		StreamRef0, ReplyTo, EvHandler, EvHandlerState0) ->
-	StreamRef = maybe_dereference(State0, StreamRef0),
+	StreamRef = maybe_dereference(State, StreamRef0),
 	{Commands, EvHandlerState1} = Proto:ws_send(Frames,
 		ProtoState, StreamRef, ReplyTo, EvHandler, EvHandlerState0),
-	{State, EvHandlerState} = commands(Commands, State0, EvHandler, EvHandlerState1),
-	{{state, State}, EvHandlerState}.
+	{ResCommands, EvHandlerState} = commands(Commands, State, EvHandler, EvHandlerState1),
+	{ResCommands, EvHandlerState}.
 
 %% Internal.
 
 commands(Command, State, EvHandler, EvHandlerState) when not is_list(Command) ->
 	commands([Command], State, EvHandler, EvHandlerState);
 commands([], State, _, EvHandlerState) ->
-	{State, EvHandlerState};
+	{{state, State}, EvHandlerState};
+commands([Error = {error, _}|_],
+		State=#tunnel_state{socket=Socket, transport=Transport},
+		_, EvHandlerState) ->
+	%% We must terminate the TLS proxy pid if any.
+	case Transport of
+		gun_tls_proxy -> gun_tls_proxy:close(Socket);
+		_ -> ok
+	end,
+	{[{state, State}, Error], EvHandlerState};
 commands([{state, ProtoState}|Tail], State, EvHandler, EvHandlerState) ->
 	commands(Tail, State#tunnel_state{protocol_state=ProtoState}, EvHandler, EvHandlerState);
 %% @todo What to do about IsFin?
@@ -476,7 +487,8 @@ commands([{switch_protocol, NewProtocol, ReplyTo}|Tail],
 		EvHandler, EvHandlerState0) ->
 	{Proto, ProtoOpts} = gun_protocols:handler_and_opts(NewProtocol, Opts),
 	%% This should only apply to Websocket for the time being.
-	{connected_ws_only, ProtoState} = Proto:init(ReplyTo, Socket, Transport, ProtoOpts),
+	%% @todo Handle error result from Proto:init/4
+	{ok, connected_ws_only, ProtoState} = Proto:init(ReplyTo, Socket, Transport, ProtoOpts),
 	#{stream_ref := StreamRef} = ProtoOpts,
 	EvHandlerState = EvHandler:protocol_changed(#{
 		stream_ref => StreamRef,
